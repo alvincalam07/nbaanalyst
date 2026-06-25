@@ -548,7 +548,57 @@ async def run_trade_agent(
 # 10.  ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    result = asyncio.run(run_trade_agent(team_a="SAS", team_b="IND"))
+    import argparse
+
+    VALID_TEAMS = sorted(TEAM_CAP_DATA.keys())
+
+    parser = argparse.ArgumentParser(
+        prog="app.py",
+        description="Wemby-GM: NBA trade analyst powered by claude-haiku-4-5-20251001",
+    )
+    parser.add_argument(
+        "team_a",
+        nargs="?",
+        default="SAS",
+        metavar="TEAM_A",
+        help=f"Initiating team. Valid: {', '.join(VALID_TEAMS)} (default: SAS)",
+    )
+    parser.add_argument(
+        "team_b",
+        nargs="?",
+        default="IND",
+        metavar="TEAM_B",
+        help=f"Receiving team. Valid: {', '.join(VALID_TEAMS)} (default: IND)",
+    )
+    parser.add_argument(
+        "--session",
+        default=None,
+        metavar="SESSION_ID",
+        help="Resume a prior session by its ID",
+    )
+
+    args = parser.parse_args()
+
+    # Validate team codes
+    errors = []
+    if args.team_a.upper() not in TEAM_CAP_DATA:
+        errors.append(f"Unknown team '{args.team_a}'. Valid teams: {', '.join(VALID_TEAMS)}")
+    if args.team_b.upper() not in TEAM_CAP_DATA:
+        errors.append(f"Unknown team '{args.team_b}'. Valid teams: {', '.join(VALID_TEAMS)}")
+    if args.team_a.upper() == args.team_b.upper():
+        errors.append("TEAM_A and TEAM_B must be different teams.")
+    if errors:
+        for e in errors:
+            print(f"[ERROR] {e}")
+        sys.exit(1)
+
+    result = asyncio.run(
+        run_trade_agent(
+            team_a=args.team_a.upper(),
+            team_b=args.team_b.upper(),
+            session_id=args.session,
+        )
+    )
     print("\n[DONE] Wemby-GM trade analysis complete.")
     print(
         f"  confidence_score   : {result['_meta']['confidence_score']}\n"
