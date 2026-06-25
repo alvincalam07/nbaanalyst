@@ -441,8 +441,27 @@ async def run_trade_agent(
         corrected_data = json.loads(_extract_json(corrected_raw))
         corrected_data["game_id"] = game_id
         proposal = TradeProposal(**corrected_data)
-        # Second violation exits gracefully — no infinite loop
-        check_cba_compliance(proposal)
+        try:
+            check_cba_compliance(proposal)
+        except ValueError as second_exc:
+            print(f"\n[CBA VIOLATION] Self-correction still invalid — no valid trade possible.")
+            print(f"  Reason: {json.loads(str(second_exc))['message']}")
+            return {
+                "game_id": game_id,
+                "session_id": session_id,
+                "trade_status": "rejected",
+                "reason": "CBA salary-match violation persisted after self-correction attempt",
+                "detail": json.loads(str(second_exc)),
+                "_meta": {
+                    "game_id": game_id,
+                    "session_id": session_id,
+                    "model": MODEL,
+                    "correction_applied": True,
+                    "critic_approved": False,
+                    "confidence_score": 0.0,
+                    "calibration_logic": "trade rejected — no CBA-compliant package possible",
+                },
+            }
 
     # ════════════════════════════════════════════════════════════════════════
     # STAGE 2 — CRITIC
