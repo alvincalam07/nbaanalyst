@@ -13,10 +13,18 @@ nba analyst/
 └── api_checks.db     # Auto-created SQLite check history (git-ignored)
 ```
 
-## Dependencies
+## Setup (first time)
 
 ```bash
-pip install anthropic pydantic python-dotenv pytest
+python -m venv venv
+
+# Windows
+.\venv\Scripts\activate
+
+# macOS / Linux
+source venv/bin/activate
+
+pip install -r requirements.txt
 ```
 
 ## Shell Commands
