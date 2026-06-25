@@ -725,3 +725,52 @@ def test_cba_rule_violation_schema():
     assert dumped["violation_type"] == "SALARY_MATCH_VIOLATION"
     assert dumped["max_allowed_ratio"] == CBA_SALARY_MATCH_LIMIT
     assert "p001" in dumped["offending_player_ids"]
+
+
+def test_second_cba_violation_detected():
+    # Both directions violate the 125% rule — no valid package exists between these two players.
+    # Verifies that check_cba_compliance raises on both the initial and corrected proposals,
+    # confirming the graceful-rejection path in run_trade_agent would trigger.
+    import pytest
+
+    expensive = Player(id="p006", name="Zach LaVine",    team="CHI", salary=43_860_600, epm=1.2, position="SG")
+    cheap     = Player(id="p011", name="Josh Giddey",    team="CHI", salary=6_630_600,  epm=0.8, position="PG")
+    ingram    = Player(id="p008", name="Brandon Ingram", team="NOP", salary=33_833_400,  epm=2.1, position="SF")
+
+    # First attempt: LaVine for Ingram — ratio 1.296 > 1.25
+    trade_v1 = TradeProposal(game_id="t1", team_a="CHI", team_b="NOP",
+                             team_a_sends=[expensive], team_b_sends=[ingram])
+    with pytest.raises(ValueError) as exc1:
+        check_cba_compliance(trade_v1)
+    assert json.loads(str(exc1.value))["actual_ratio"] == pytest.approx(1.296, rel=1e-2)
+
+    # Corrected attempt: Giddey for Ingram — ratio 5.10 > 1.25 (worse)
+    trade_v2 = TradeProposal(game_id="t1", team_a="CHI", team_b="NOP",
+                             team_a_sends=[cheap], team_b_sends=[ingram])
+    with pytest.raises(ValueError) as exc2:
+        check_cba_compliance(trade_v2)
+    assert json.loads(str(exc2.value))["actual_ratio"] == pytest.approx(5.10, rel=1e-2)
+
+
+def test_graceful_rejection_payload_shape():
+    # Validate the structure of the rejection dict returned when no valid trade exists.
+    rejection = {
+        "game_id": "GM-TEST",
+        "session_id": "test-session",
+        "trade_status": "rejected",
+        "reason": "CBA salary-match violation persisted after self-correction attempt",
+        "detail": {"violation_type": "SALARY_MATCH_VIOLATION", "actual_ratio": 5.1},
+        "_meta": {
+            "game_id": "GM-TEST",
+            "session_id": "test-session",
+            "model": MODEL,
+            "correction_applied": True,
+            "critic_approved": False,
+            "confidence_score": 0.0,
+            "calibration_logic": "trade rejected — no CBA-compliant package possible",
+        },
+    }
+    assert rejection["trade_status"] == "rejected"
+    assert rejection["_meta"]["confidence_score"] == 0.0
+    assert rejection["_meta"]["correction_applied"] is True
+    assert rejection["detail"]["violation_type"] == "SALARY_MATCH_VIOLATION"
