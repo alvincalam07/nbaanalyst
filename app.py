@@ -317,231 +317,284 @@ def _extract_json(text: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9.  HAIKU AGENTIC LOOP  (Generator → Critic → Refiner)
+# 9.  COORDINATOR / SUBAGENT ARCHITECTURE
 # ─────────────────────────────────────────────────────────────────────────────
 MODEL = "claude-haiku-4-5-20251001"
 
-_SYSTEM_PROMPT = """\
-You are Wemby-GM, an expert NBA trade analyst operating a 3-stage workflow.
-
-Stage 1  GENERATOR  — Draft a valid two-team trade using ONLY the players supplied.
-Stage 2  CRITIC     — Audit the draft for CBA compliance and basketball merit.
-Stage 3  REFINER    — Produce a polished, final JSON payload.
-
+# Per-agent system prompts — each subagent knows only its own role.
+_GENERATOR_SYSTEM = """\
+You are GeneratorAgent for Wemby-GM, an NBA trade proposal drafter.
+Given two team rosters and salary cap data, draft a valid two-team trade
+that respects the CBA salary-match limit provided in the context.
 Rules:
-- Respond with raw minified JSON when asked for structured output. No markdown fences.
-- Never invent players, salaries, or IDs not present in the supplied roster.
-- Salary packages must respect the CBA salary-match limit stated in the context.
+- Use ONLY player IDs, names, salaries, and positions from the supplied rosters.
+- Never invent players, teams, or salaries.
+- Return raw minified JSON only — no markdown fences, no commentary.
+Schema: {"game_id":"...","team_a":"...","team_b":"...","team_a_sends":[<players>],"team_b_sends":[<players>]}
+"""
+
+_CRITIC_SYSTEM = """\
+You are CriticAgent for Wemby-GM, an NBA trade compliance auditor.
+Given a trade proposal JSON, evaluate it on three dimensions:
+  1. CBA salary-match ratio (must be <= 1.25x in both directions)
+  2. EPM delta gained/lost by each team
+  3. Hard-cap headroom remaining after the trade
+Return raw minified JSON only — no markdown, no commentary.
+Schema: {"cba_compliant":true/false,"approved":true/false,"critique":"<one sentence>"}
+"""
+
+_REFINER_SYSTEM = """\
+You are RefinerAgent for Wemby-GM, an NBA trade report writer.
+Given a validated trade proposal, critic feedback, and pre-computed confidence
+metrics, produce the final polished trade summary payload.
+Include: full trade details, one-sentence rationale per team, and embed the
+confidence_score and calibration_logic values verbatim as provided.
+Return a single minified JSON object only — no markdown, no commentary.
 """
 
 
-async def _call_haiku(
-    client: anthropic.AsyncAnthropic,
-    messages: List[Dict],
-) -> str:
-    response = await client.messages.create(
-        model=MODEL,
-        max_tokens=2048,
-        system=_SYSTEM_PROMPT,
-        messages=messages,
-    )
-    return response.content[0].text
+# ── SubAgent ──────────────────────────────────────────────────────────────────
 
+class SubAgent:
+    """
+    Isolated single-purpose agent with its own message context.
+    Each instance is independent — it sees only what the Coordinator
+    explicitly passes to it, never the other agents' histories.
+    """
+
+    def __init__(self, name: str, system_prompt: str) -> None:
+        self.name = name
+        self.system_prompt = system_prompt
+        self.messages: List[Dict] = []
+
+    async def send(
+        self,
+        client: anthropic.AsyncAnthropic,
+        user_content: str,
+        max_tokens: int = 2048,
+    ) -> str:
+        self.messages.append({"role": "user", "content": user_content})
+        response = await client.messages.create(
+            model=MODEL,
+            max_tokens=max_tokens,
+            system=self.system_prompt,
+            messages=self.messages,
+        )
+        reply = response.content[0].text
+        self.messages.append({"role": "assistant", "content": reply})
+        return reply
+
+
+# ── CoordinatorAgent ──────────────────────────────────────────────────────────
+
+class CoordinatorAgent:
+    """
+    Owns the end-to-end trade workflow. Spawns three SubAgents (Generator,
+    Critic, Refiner), routes structured outputs between them, handles CBA
+    validation and self-correction, and persists session checkpoints.
+
+    Each SubAgent receives only the context it needs:
+      Generator  — full roster + cap data
+      Critic     — trade proposal JSON only
+      Refiner    — proposal JSON + critic feedback + confidence metrics
+    """
+
+    def __init__(
+        self,
+        team_a: str,
+        team_b: str,
+        session_id: str,
+        game_id: str,
+        client: anthropic.AsyncAnthropic,
+    ) -> None:
+        self.team_a = team_a
+        self.team_b = team_b
+        self.session_id = session_id
+        self.game_id = game_id
+        self.client = client
+
+        self.generator = SubAgent("generator", _GENERATOR_SYSTEM)
+        self.critic    = SubAgent("critic",    _CRITIC_SYSTEM)
+        self.refiner   = SubAgent("refiner",   _REFINER_SYSTEM)
+
+    # ── internal helpers ─────────────────────────────────────────────────────
+
+    def _build_context(self) -> str:
+        return json.dumps({
+            "game_id": self.game_id,
+            "team_a": self.team_a,
+            "team_b": self.team_b,
+            "roster_a": [p for p in MOCK_PLAYERS if p["team"] == self.team_a],
+            "roster_b": [p for p in MOCK_PLAYERS if p["team"] == self.team_b],
+            "cap_a": TEAM_CAP_DATA.get(self.team_a, {}),
+            "cap_b": TEAM_CAP_DATA.get(self.team_b, {}),
+            "cba_salary_match_limit": CBA_SALARY_MATCH_LIMIT,
+        }, indent=2)
+
+    def _checkpoint(self, step: int) -> None:
+        state = {
+            "generator": self.generator.messages,
+            "critic":    self.critic.messages,
+            "refiner":   self.refiner.messages,
+        }
+        save_session_state(self.session_id, step, json.dumps(state))
+
+    def _header(self, agent_name: str) -> None:
+        print(f"\n{'='*64}")
+        print(f"  [{agent_name.upper()}]   game_id={self.game_id}")
+        print(f"{'='*64}")
+
+    def _rejection_payload(self, exc: ValueError) -> Dict[str, Any]:
+        print(f"\n[COORDINATOR] Both trade attempts failed CBA check — rejecting.")
+        detail = json.loads(str(exc))
+        print(f"  Reason: {detail['message']}")
+        return {
+            "game_id": self.game_id,
+            "session_id": self.session_id,
+            "trade_status": "rejected",
+            "reason": "CBA salary-match violation persisted after self-correction",
+            "detail": detail,
+            "_meta": {
+                "game_id": self.game_id,
+                "session_id": self.session_id,
+                "model": MODEL,
+                "correction_applied": True,
+                "critic_approved": False,
+                "confidence_score": 0.0,
+                "calibration_logic": "trade rejected — no CBA-compliant package possible",
+            },
+        }
+
+    # ── orchestration ────────────────────────────────────────────────────────
+
+    async def run(self) -> Dict[str, Any]:
+        context = self._build_context()
+        correction_applied = False
+        critic_approved = False
+        proposal: Optional[TradeProposal] = None
+
+        # ── GENERATOR SubAgent ────────────────────────────────────────────────
+        self._header("GeneratorAgent")
+        gen_prompt = (
+            f"Draft a two-team trade between {self.team_a} and {self.team_b}.\n"
+            f"CBA salary-match limit: {CBA_SALARY_MATCH_LIMIT}x\n\n"
+            f"Context:\n{context}"
+        )
+        try:
+            gen_raw = await self.generator.send(self.client, gen_prompt)
+            print(f"[GeneratorAgent]\n{gen_raw}\n")
+            self._checkpoint(1)
+
+            gen_data = json.loads(_extract_json(gen_raw))
+            gen_data["game_id"] = self.game_id
+            proposal = TradeProposal(**gen_data)
+            check_cba_compliance(proposal)
+
+        except ValueError as exc:
+            # Coordinator intercepts CBA violation, routes correction back to
+            # the Generator SubAgent (keeping the error in its own context).
+            print(f"\n[COORDINATOR] CBA violation detected — dispatching self-correction to GeneratorAgent.")
+            correction_applied = True
+
+            correction_prompt = (
+                f"CBA RULE VIOLATION — self-correct once.\n\n"
+                f"Error (CBARuleViolation JSON):\n{exc}\n\n"
+                f"Redraft so both salary packages are within "
+                f"{CBA_SALARY_MATCH_LIMIT * 100:.0f}% of each other. "
+                f"Use the same roster. Return minified JSON only."
+            )
+            corrected_raw = await self.generator.send(self.client, correction_prompt)
+            print(f"[GeneratorAgent — corrected]\n{corrected_raw}\n")
+            self._checkpoint(2)
+
+            corrected_data = json.loads(_extract_json(corrected_raw))
+            corrected_data["game_id"] = self.game_id
+            proposal = TradeProposal(**corrected_data)
+            try:
+                check_cba_compliance(proposal)
+            except ValueError as second_exc:
+                return self._rejection_payload(second_exc)
+
+        # ── CRITIC SubAgent ───────────────────────────────────────────────────
+        # Critic receives only the validated trade JSON — not the generator history.
+        self._header("CriticAgent")
+        critic_prompt = (
+            f"Audit this trade proposal for CBA compliance and basketball merit:\n\n"
+            f"{json.dumps(proposal.model_dump(), indent=2)}"
+        )
+        critic_raw = await self.critic.send(self.client, critic_prompt)
+        print(f"[CriticAgent]\n{critic_raw}\n")
+        self._checkpoint(3)
+
+        try:
+            critic_approved = bool(json.loads(_extract_json(critic_raw)).get("approved", False))
+        except (json.JSONDecodeError, KeyError):
+            critic_approved = False
+
+        # ── REFINER SubAgent ──────────────────────────────────────────────────
+        # Refiner receives trade + critique + confidence — not generator history.
+        self._header("RefinerAgent")
+        confidence = compute_confidence(proposal, correction_applied, critic_approved)
+        refiner_prompt = (
+            f"Build the final trade summary payload.\n\n"
+            f"Trade Proposal:\n{json.dumps(proposal.model_dump(), indent=2)}\n\n"
+            f"Critic Feedback:\n{critic_raw}\n\n"
+            f"Embed these confidence metrics verbatim:\n"
+            f'  "confidence_score": {confidence["confidence_score"]},\n'
+            f'  "calibration_logic": "{confidence["calibration_logic"]}"\n\n'
+            f"Return a single minified JSON object. No markdown."
+        )
+        refiner_raw = await self.refiner.send(self.client, refiner_prompt)
+        print(f"[RefinerAgent]\n{refiner_raw}\n")
+        self._checkpoint(4)
+
+        # ── Coordinator assembles final payload ───────────────────────────────
+        try:
+            final_payload: Dict[str, Any] = json.loads(_extract_json(refiner_raw))
+        except json.JSONDecodeError:
+            final_payload = {"raw_refiner_output": refiner_raw}
+
+        final_payload["_meta"] = {
+            "game_id": self.game_id,
+            "session_id": self.session_id,
+            "model": MODEL,
+            "agents": ["GeneratorAgent", "CriticAgent", "RefinerAgent"],
+            "correction_applied": correction_applied,
+            "critic_approved": critic_approved,
+            **confidence,
+        }
+
+        print(f"\n{'='*64}")
+        print("  FINAL PAYLOAD")
+        print(f"{'='*64}")
+        print(json.dumps(final_payload, indent=2))
+        return final_payload
+
+
+# ── Public entry-point wrapper ────────────────────────────────────────────────
 
 async def run_trade_agent(
     team_a: str,
     team_b: str,
     session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Thin wrapper: creates a CoordinatorAgent and runs it."""
     session_id = session_id or str(uuid.uuid4())
     game_id = f"GM-{session_id[:8].upper()}"
-
     client = anthropic.AsyncAnthropic(api_key=_API_KEY)
 
-    # ── Session resumption ───────────────────────────────────────────────────
     prior = load_session_state(session_id)
     if prior:
-        print(f"[SESSION] Resuming {session_id} from step {prior['step']}")
-        messages: List[Dict] = prior["history"]
-    else:
-        messages = []
+        print(f"[COORDINATOR] Resuming session {session_id} from step {prior['step']}")
 
-    # ── Build context payload ────────────────────────────────────────────────
-    roster_a = [p for p in MOCK_PLAYERS if p["team"] == team_a]
-    roster_b = [p for p in MOCK_PLAYERS if p["team"] == team_b]
-
-    context_payload = json.dumps({
-        "game_id": game_id,
-        "team_a": team_a,
-        "team_b": team_b,
-        "roster_a": roster_a,
-        "roster_b": roster_b,
-        "cap_a": TEAM_CAP_DATA.get(team_a, {}),
-        "cap_b": TEAM_CAP_DATA.get(team_b, {}),
-        "cba_salary_match_limit": CBA_SALARY_MATCH_LIMIT,
-    }, indent=2)
-
-    correction_applied = False
-    critic_approved = False
-    proposal: Optional[TradeProposal] = None
-
-    # ════════════════════════════════════════════════════════════════════════
-    # STAGE 1 — GENERATOR
-    # ════════════════════════════════════════════════════════════════════════
-    print(f"\n{'='*64}")
-    print(f"  STAGE 1 — GENERATOR   game_id={game_id}")
-    print(f"{'='*64}")
-
-    stage1_prompt = (
-        f"STAGE 1 — GENERATOR\n\n"
-        f"Draft a two-team trade between {team_a} and {team_b} using ONLY the "
-        f"players listed below. Both salary packages must be within the "
-        f"{CBA_SALARY_MATCH_LIMIT * 100:.0f}% CBA salary-match rule.\n\n"
-        f"Context:\n{context_payload}\n\n"
-        f"Return ONLY minified JSON — no markdown, no commentary:\n"
-        f'{{"game_id":"<id>","team_a":"<team>","team_b":"<team>",'
-        f'"team_a_sends":[<player_objects>],"team_b_sends":[<player_objects>]}}'
+    coordinator = CoordinatorAgent(
+        team_a=team_a,
+        team_b=team_b,
+        session_id=session_id,
+        game_id=game_id,
+        client=client,
     )
-
-    messages.append({"role": "user", "content": stage1_prompt})
-    messages = trim_context(messages, game_id)
-
-    try:
-        gen_raw = await _call_haiku(client, messages)
-        print(f"[GENERATOR]\n{gen_raw}\n")
-        messages.append({"role": "assistant", "content": gen_raw})
-        save_session_state(session_id, 1, json.dumps(messages))
-
-        gen_data = json.loads(_extract_json(gen_raw))
-        gen_data["game_id"] = game_id
-        proposal = TradeProposal(**gen_data)
-        check_cba_compliance(proposal)
-
-    except ValueError as exc:
-        # ── STRUCTURED ERROR SELF-CORRECTION ────────────────────────────────
-        print(f"\n[CBA VIOLATION] Autonomous self-correction triggered.")
-        correction_applied = True
-
-        correction_msg = (
-            f"CBA RULE VIOLATION — you must self-correct once.\n\n"
-            f"Error details (CBARuleViolation JSON):\n{exc}\n\n"
-            f"Redraft the trade so both salary packages are within "
-            f"{CBA_SALARY_MATCH_LIMIT * 100:.0f}% of each other. "
-            f"Use the same player roster as before. "
-            f"Return ONLY minified JSON, no markdown."
-        )
-        messages.append({"role": "user", "content": correction_msg})
-        messages = trim_context(messages, game_id)
-
-        corrected_raw = await _call_haiku(client, messages)
-        print(f"[SELF-CORRECTION]\n{corrected_raw}\n")
-        messages.append({"role": "assistant", "content": corrected_raw})
-        save_session_state(session_id, 2, json.dumps(messages))
-
-        corrected_data = json.loads(_extract_json(corrected_raw))
-        corrected_data["game_id"] = game_id
-        proposal = TradeProposal(**corrected_data)
-        try:
-            check_cba_compliance(proposal)
-        except ValueError as second_exc:
-            print(f"\n[CBA VIOLATION] Self-correction still invalid — no valid trade possible.")
-            print(f"  Reason: {json.loads(str(second_exc))['message']}")
-            return {
-                "game_id": game_id,
-                "session_id": session_id,
-                "trade_status": "rejected",
-                "reason": "CBA salary-match violation persisted after self-correction attempt",
-                "detail": json.loads(str(second_exc)),
-                "_meta": {
-                    "game_id": game_id,
-                    "session_id": session_id,
-                    "model": MODEL,
-                    "correction_applied": True,
-                    "critic_approved": False,
-                    "confidence_score": 0.0,
-                    "calibration_logic": "trade rejected — no CBA-compliant package possible",
-                },
-            }
-
-    # ════════════════════════════════════════════════════════════════════════
-    # STAGE 2 — CRITIC
-    # ════════════════════════════════════════════════════════════════════════
-    print(f"\n{'='*64}")
-    print(f"  STAGE 2 — CRITIC   game_id={game_id}")
-    print(f"{'='*64}")
-
-    stage2_prompt = (
-        f"STAGE 2 — CRITIC\n\n"
-        f"Audit the trade proposal above for:\n"
-        f"  1. CBA salary-match compliance (limit: {CBA_SALARY_MATCH_LIMIT}x)\n"
-        f"  2. Basketball merit — EPM delta for each team\n"
-        f"  3. Hard-cap headroom impact\n\n"
-        f'Return ONLY minified JSON: {{"cba_compliant":true/false,'
-        f'"approved":true/false,"critique":"<one sentence>"}}'
-    )
-    messages.append({"role": "user", "content": stage2_prompt})
-    messages = trim_context(messages, game_id)
-
-    critic_raw = await _call_haiku(client, messages)
-    print(f"[CRITIC]\n{critic_raw}\n")
-    messages.append({"role": "assistant", "content": critic_raw})
-    save_session_state(session_id, 3, json.dumps(messages))
-
-    try:
-        critic_data = json.loads(_extract_json(critic_raw))
-        critic_approved = bool(critic_data.get("approved", False))
-    except (json.JSONDecodeError, KeyError):
-        critic_approved = False
-
-    # ════════════════════════════════════════════════════════════════════════
-    # STAGE 3 — REFINER
-    # ════════════════════════════════════════════════════════════════════════
-    print(f"\n{'='*64}")
-    print(f"  STAGE 3 — REFINER   game_id={game_id}")
-    print(f"{'='*64}")
-
-    assert proposal is not None, "proposal must be set before Refiner stage"
-    confidence = compute_confidence(proposal, correction_applied, critic_approved)
-
-    stage3_prompt = (
-        f"STAGE 3 — REFINER\n\n"
-        f"Produce the final trade-summary payload. Include:\n"
-        f"  - Full trade details (teams, players sent each way, salary totals)\n"
-        f"  - A one-sentence rationale for each team\n"
-        f"  - These pre-computed confidence metrics verbatim:\n"
-        f'      "confidence_score": {confidence["confidence_score"]},\n'
-        f'      "calibration_logic": "{confidence["calibration_logic"]}"\n\n'
-        f"Return ONLY a single minified JSON object. No markdown, no commentary."
-    )
-    messages.append({"role": "user", "content": stage3_prompt})
-    messages = trim_context(messages, game_id)
-
-    refiner_raw = await _call_haiku(client, messages)
-    print(f"[REFINER]\n{refiner_raw}\n")
-    messages.append({"role": "assistant", "content": refiner_raw})
-    save_session_state(session_id, 4, json.dumps(messages))
-
-    # ── Assemble final output ────────────────────────────────────────────────
-    try:
-        final_payload: Dict[str, Any] = json.loads(_extract_json(refiner_raw))
-    except json.JSONDecodeError:
-        final_payload = {"raw_refiner_output": refiner_raw}
-
-    final_payload["_meta"] = {
-        "game_id": game_id,
-        "session_id": session_id,
-        "model": MODEL,
-        "correction_applied": correction_applied,
-        "critic_approved": critic_approved,
-        **confidence,
-    }
-
-    print(f"\n{'='*64}")
-    print("  FINAL PAYLOAD")
-    print(f"{'='*64}")
-    print(json.dumps(final_payload, indent=2))
-
-    return final_payload
+    return await coordinator.run()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -803,12 +856,11 @@ def test_second_cba_violation_detected():
 
 
 def test_graceful_rejection_payload_shape():
-    # Validate the structure of the rejection dict returned when no valid trade exists.
     rejection = {
         "game_id": "GM-TEST",
         "session_id": "test-session",
         "trade_status": "rejected",
-        "reason": "CBA salary-match violation persisted after self-correction attempt",
+        "reason": "CBA salary-match violation persisted after self-correction",
         "detail": {"violation_type": "SALARY_MATCH_VIOLATION", "actual_ratio": 5.1},
         "_meta": {
             "game_id": "GM-TEST",
@@ -824,3 +876,57 @@ def test_graceful_rejection_payload_shape():
     assert rejection["_meta"]["confidence_score"] == 0.0
     assert rejection["_meta"]["correction_applied"] is True
     assert rejection["detail"]["violation_type"] == "SALARY_MATCH_VIOLATION"
+
+
+def test_sub_agent_init():
+    agent = SubAgent("generator", _GENERATOR_SYSTEM)
+    assert agent.name == "generator"
+    assert agent.messages == []
+    assert "GeneratorAgent" in agent.system_prompt
+
+
+def test_sub_agent_isolated_contexts():
+    # Three SubAgents must have entirely separate message histories.
+    gen  = SubAgent("generator", _GENERATOR_SYSTEM)
+    crit = SubAgent("critic",    _CRITIC_SYSTEM)
+    ref  = SubAgent("refiner",   _REFINER_SYSTEM)
+    gen.messages.append({"role": "user", "content": "draft a trade"})
+    assert crit.messages == []
+    assert ref.messages  == []
+
+
+def test_coordinator_agent_init():
+    import anthropic as _ant
+    client = _ant.AsyncAnthropic(api_key="sk-ant-test-key")
+    coord = CoordinatorAgent("SAS", "IND", "sess-01", "GM-SESS0001", client)
+    assert coord.team_a == "SAS"
+    assert coord.team_b == "IND"
+    assert isinstance(coord.generator, SubAgent)
+    assert isinstance(coord.critic,    SubAgent)
+    assert isinstance(coord.refiner,   SubAgent)
+    # All three subagents start with empty message histories
+    assert coord.generator.messages == []
+    assert coord.critic.messages    == []
+    assert coord.refiner.messages   == []
+
+
+def test_coordinator_builds_context():
+    import anthropic as _ant
+    client = _ant.AsyncAnthropic(api_key="sk-ant-test-key")
+    coord = CoordinatorAgent("PHX", "MIA", "sess-02", "GM-SESS0002", client)
+    ctx = json.loads(coord._build_context())
+    assert ctx["team_a"] == "PHX"
+    assert ctx["team_b"] == "MIA"
+    assert any(p["team"] == "PHX" for p in ctx["roster_a"])
+    assert any(p["team"] == "MIA" for p in ctx["roster_b"])
+    assert ctx["cba_salary_match_limit"] == CBA_SALARY_MATCH_LIMIT
+
+
+def test_meta_includes_agent_list():
+    # Final _meta should name all three subagents.
+    agents = ["GeneratorAgent", "CriticAgent", "RefinerAgent"]
+    meta = {"agents": agents, "model": MODEL}
+    assert "GeneratorAgent" in meta["agents"]
+    assert "CriticAgent"    in meta["agents"]
+    assert "RefinerAgent"   in meta["agents"]
+    assert len(meta["agents"]) == 3
